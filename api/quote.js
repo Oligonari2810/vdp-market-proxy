@@ -1,12 +1,10 @@
-const FH_KEY = "d6q46lhr01qhcrmiq8s0d6q46lhr01qhcrmiq8sg";
-
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const { symbol } = req.query;
   if (!symbol) return res.status(400).json({ error: "symbol required" });
+
+  const FH_KEY = "d6q46lhr01qhcrmiq8s0d6q46lhr01qhcrmiq8sg";
 
   try {
     const [quote, profile, metrics] = await Promise.all([
