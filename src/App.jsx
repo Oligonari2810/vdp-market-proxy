@@ -358,7 +358,7 @@ export default function App(){
       else showToast(t("ℹ️ Bolsa no-US — vía web search","ℹ️ Non-US — via web search"));
       setStepIdx(1);
 
-      const res=await fetch("https://api.anthropic.com/v1/messages",{
+      const res=await fetch("/api/analyze",{
         method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
           model:"claude-sonnet-4-20250514",max_tokens:8000,
