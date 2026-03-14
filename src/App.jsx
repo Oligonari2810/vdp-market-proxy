@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const PROXY = "https://vdp-market-proxy-o1r9du18a-oligonari2810s-projects.vercel.app";
+const PROXY = "https://vdp-market-proxy.vercel.app";
 
 const CFG = {
   thresholds: { go: 80, goCond: 64, watch: 49 },
