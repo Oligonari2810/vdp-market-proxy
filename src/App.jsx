@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 const PROXY = "https://vdp-market-proxy-o1r9du18a-oligonari2810s-projects.vercel.app";
 
@@ -111,8 +111,74 @@ const STEPS={
 const US_EXCHANGES=["NYSE","NASDAQ"];
 
 function maxScore(w){return Object.values(w).reduce((a,v)=>a+5*v,0);}
-function fmt(v,dec=2){if(v==null||isNaN(v))return null;return Number(v).toFixed(dec);}
 function fmtB(v){if(!v)return null;const abs=Math.abs(v);if(abs>=1e12)return `$${(v/1e12).toFixed(2)}T`;if(abs>=1e9)return `$${(v/1e9).toFixed(2)}B`;if(abs>=1e6)return `$${(v/1e6).toFixed(2)}M`;return `$${v}`;}
+
+// Strip citation tags from Claude responses
+function stripCites(text){
+  if(!text) return "";
+  return text.replace(/<cite[^>]*>([^<]*)<\/cite>/gi,"$1").replace(/<\/?cite[^>]*>/gi,"").trim();
+}
+
+// Sanity checks on metrics
+function sanityCheck(metrics, sector){
+  const warnings = [];
+  const per = parseFloat(metrics?.per);
+  const evEbitda = parseFloat(metrics?.evEbitda);
+  const netDebt = parseFloat(metrics?.netDebtEbitda);
+  const roe = parseFloat(metrics?.roe);
+  if(!isNaN(per) && per < 0) warnings.push("⚠️ PER negativo — empresa con pérdidas");
+  if(!isNaN(per) && per > 100) warnings.push("⚠️ PER >100 — valoración muy elevada, verifica");
+  if(!isNaN(evEbitda) && evEbitda > 50) warnings.push("⚠️ EV/EBITDA >50 — posible sobrevaloración");
+  if(!isNaN(netDebt) && netDebt > 10) warnings.push("⚠️ Deuda/EBITDA >10 — riesgo alto de insolvencia");
+  if(!isNaN(roe) && roe > 50 && sector !== "financial") warnings.push("⚠️ ROE >50% — verifica si es correcto");
+  return warnings;
+}
+
+// Check analysis age
+function analysisAge(dateStr){
+  try {
+    const parts = dateStr.split(" ");
+    const months = {ene:0,feb:1,mar:2,abr:3,may:4,jun:5,jul:6,ago:7,sep:8,oct:9,nov:10,dic:11};
+    const d = new Date(parts[2], months[parts[1]?.toLowerCase()] ?? 0, parseInt(parts[0]));
+    const days = Math.round((Date.now() - d.getTime()) / (1000*3600*24));
+    return days;
+  } catch { return 0; }
+}
+
+// Export CSV
+function exportCSV(a, lang){
+  const t=(es,en)=>lang==="es"?es:en;
+  const rows = [
+    ["Campo","Valor","Fuente","Fecha"],
+    ["Ticker", a.ticker, "input", a.date],
+    ["Empresa", a.name, a.confidence?.name||"IA", a.date],
+    ["Bolsa", a.exchange, "input", a.date],
+    ["Sector", a.sector, a.confidence?.sector||"IA", a.date],
+    ["Precio", a.price, a.confidence?.price||"est", a.date],
+    ["Market Cap", a.marketCap, a.confidence?.marketCap||"est", a.date],
+    ["PER", a.metrics?.per, a.confidence?.per||"est", a.date],
+    ["EV/EBITDA", a.metrics?.evEbitda, a.confidence?.evEbitda||"est", a.date],
+    ["Net Deuda/EBITDA", a.metrics?.netDebtEbitda, a.confidence?.netDebtEbitda||"est", a.date],
+    ["ROE", a.metrics?.roe, a.confidence?.roe||"est", a.date],
+    ["Beta", a.metrics?.beta, a.confidence?.beta||"est", a.date],
+    ["Dividendo", a.metrics?.dividendYield, a.confidence?.dividendYield||"est", a.date],
+    ["Score", `${a.totalScore}/${a.maxScore}`, "VDP", a.date],
+    ["Veredicto", a.verdict, "VDP", a.date],
+    ...["f1","f2","f3","f4","f5","f6","f7","f8"].map(k=>[
+      a.sectorConfig?.filterNames?.[k]?.[lang==="es"?"es":"en"]||k,
+      `${a.filters?.[k]?.score||0}/5`,
+      "IA", a.date
+    ]),
+    [t("Tesis","Thesis"), (a[lang==="es"?"investmentThesis_es":"investmentThesis_en"]||"").replace(/\n/g," "), "IA", a.date],
+    [t("Condiciones","Conditions"), (a[lang==="es"?"conditions_es":"conditions_en"]||"").replace(/\n/g," "), "IA", a.date],
+  ];
+  const csv = rows.map(r=>r.map(c=>`"${String(c||"").replace(/"/g,'""')}"`).join(",")).join("\n");
+  const blob = new Blob(["\uFEFF"+csv], {type:"text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a2 = document.createElement("a");
+  a2.href = url; a2.download = `VDP_${a.ticker}_${a.date}.csv`;
+  a2.click(); URL.revokeObjectURL(url);
+}
 
 async function fetchFinnhub(tk, exchange){
   const isUS = US_EXCHANGES.includes(exchange);
@@ -142,20 +208,21 @@ async function fetchFinnhub(tk, exchange){
   }
 }
 
-function buildPrompt(sec,fmpData){
+function buildPrompt(sec,fhData){
   const fk=["f1","f2","f3","f4","f5","f6","f7","f8"];
   const ws=fk.map(k=>`${k.toUpperCase()}:x${sec.weights[k]||1}`).join(" ");
   const ms=maxScore(sec.weights).toFixed(1);
   const names=fk.map(k=>`${k}=${sec.filterNames[k]?.en||k}`).join(" ");
   const th={go:80,goCond:64,watch:49};
-  const vBlock=Object.keys(fmpData.verified).length>0
-    ?`\n\nVERIFIED_DATA_FROM_FINNHUB (use these exact values):\n${JSON.stringify(fmpData.verified,null,2)}`:"";
+  const vBlock=Object.keys(fhData.verified).length>0
+    ?`\n\nVERIFIED_DATA_FROM_FINNHUB (use these exact values, do NOT add citation tags):\n${JSON.stringify(fhData.verified,null,2)}`:"";
   return `You are Vendedor de Palas analyzer — ${sec.expertise.en}
 SECTOR:${sec.names.en} WEIGHTS:${ws} MAX:${ms}pts DISQUALIFIER:${sec.disqualifier.toUpperCase()}=1→NOGO
 THRESHOLDS: GO>=${th.go}% GO_COND>=${th.goCond}% WATCH>=${th.watch}%
 FILTERS: ${names}${vBlock}
-IMPORTANT: chainLevel must be ONE of: OEM/Tier1/Tier2/Upstream/Midstream/Downstream/Aftermarket/Distributor/Platform/Diversified
-Use web_search for qualitative data (CEO, shareholders, controversies, cycle, ESG). Return ONLY valid JSON no markdown:
+CRITICAL: Do NOT include any XML tags, citation tags, or markdown in string fields. Plain text only.
+chainLevel must be ONE of: OEM/Tier1/Tier2/Upstream/Midstream/Downstream/Aftermarket/Distributor/Platform/Diversified
+Use web_search for qualitative data. Return ONLY valid JSON no markdown:
 {"name":"","sector":"","price":"","marketCap":"","metrics":{"per":"","evEbitda":"","netDebtEbitda":"","roe":"","beta":"","dividendYield":""},"confidence":{"price":"verified","marketCap":"verified","per":"verified","evEbitda":"verified","netDebtEbitda":"verified","roe":"verified"},"layer1":{"feverValid":true,"chainLevel":"OEM","summary_es":"","summary_en":""},"layer2":{"ceo":{"name":"","tenure":"","skinInGame":"","signal":"green","summary_es":"","summary_en":""},"shareholders":{"topHolder":"","type":"fund","signal":"green","summary_es":"","summary_en":""},"controversies":{"active":false,"severity":"none","signal":"green","summary_es":"","summary_en":""}},"filters":{"f1":{"score":4,"pts":8,"summary_es":"","summary_en":""},"f2":{"score":4,"pts":6,"summary_es":"","summary_en":""},"f3":{"score":4,"pts":6,"summary_es":"","summary_en":""},"f4":{"score":4,"pts":6,"summary_es":"","summary_en":""},"f5":{"score":4,"pts":4,"summary_es":"","summary_en":""},"f6":{"score":4,"pts":4,"summary_es":"","summary_en":""},"f7":{"score":4,"pts":4,"summary_es":"","summary_en":""},"f8":{"score":4,"pts":4,"summary_es":"","summary_en":""}},"totalScore":42,"maxScore":${ms},"verdict":"GO","f1Override":false,"investmentThesis_es":"","investmentThesis_en":"","conditions_es":"","conditions_en":""}`;
 }
 
@@ -184,7 +251,7 @@ function MetricCard({label,value,sub,conf,subConf}){
   );
 }
 
-function Results({a,lang}){
+function Results({a,lang,onReanalyze,onExport}){
   const t=(es,en)=>lang==="es"?es:en;
   const sec=CFG.sectors.find(s=>s.key===a.sectorKey)||CFG.sectors[CFG.sectors.length-1];
   const saved=a.sectorConfig||{weights:sec.weights,filterNames:sec.filterNames,disqualifier:sec.disqualifier};
@@ -198,26 +265,52 @@ function Results({a,lang}){
   const cd={background:"white",border:`1px solid ${C.cream2}`,borderRadius:6,padding:"1rem",boxShadow:"0 1px 6px rgba(13,31,60,0.06)"};
   const verifiedCount=Object.values(conf).filter(v=>v==="verified"||v==="Finnhub").length;
   const totalConf=Object.keys(conf).length;
+  const days=analysisAge(a.date);
+  const warnings=sanityCheck(a.metrics, a.sectorKey);
 
   return(
     <div style={{padding:"1.5rem"}}>
+      {/* Age warning */}
+      {days>30&&(
+        <div style={{background:C.yellowBg,border:`1px solid ${C.gold}`,borderRadius:6,padding:"10px 14px",marginBottom:"1rem",fontFamily:"monospace",fontSize:"0.58rem",color:"#7a5f00",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span>⚠️ {t(`Análisis de hace ${days} días — datos pueden haber cambiado`,`Analysis ${days} days old — data may have changed`)}</span>
+          <button onClick={onReanalyze} style={{fontFamily:"monospace",fontSize:"0.55rem",fontWeight:700,padding:"4px 10px",background:C.gold,color:C.navy,border:"none",borderRadius:4,cursor:"pointer"}}>{t("Re-analizar","Re-analyze")}</button>
+        </div>
+      )}
+
+      {/* Sanity warnings */}
+      {warnings.length>0&&(
+        <div style={{background:C.redBg,border:`1px solid ${C.red}`,borderRadius:6,padding:"10px 14px",marginBottom:"1rem"}}>
+          {warnings.map((w,i)=><div key={i} style={{fontFamily:"monospace",fontSize:"0.58rem",color:C.red}}>{w}</div>)}
+        </div>
+      )}
+
+      {/* Header */}
       <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:"1.25rem",paddingBottom:"1.25rem",borderBottom:`2px solid rgba(201,168,76,0.2)`,flexWrap:"wrap",gap:"1rem"}}>
         <div>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
             <span>{sec.icon}</span>
             <span style={{fontFamily:"monospace",fontSize:"0.52rem",fontWeight:700,textTransform:"uppercase",color:C.muted,background:C.cream2,padding:"3px 8px",borderRadius:10}}>{t(sec.names.es,sec.names.en)}</span>
             {totalConf>0&&<span style={{fontFamily:"monospace",fontSize:"0.48rem",padding:"3px 8px",borderRadius:10,background:verifiedCount>=4?C.verifiedBg:C.estimatedBg,color:verifiedCount>=4?C.verifiedText:C.estimatedText,border:`1px solid ${verifiedCount>=4?"rgba(26,107,60,0.3)":"rgba(201,168,76,0.3)"}`}}>{verifiedCount}/{totalConf} ✓ Finnhub</span>}
+            {days>0&&days<=30&&<span style={{fontFamily:"monospace",fontSize:"0.45rem",color:C.muted,background:C.cream2,padding:"2px 6px",borderRadius:8}}>{days}d</span>}
           </div>
           <h2 style={{fontFamily:"Georgia,serif",fontSize:"1.7rem",fontWeight:900,color:C.navy,lineHeight:1.1,margin:0}}>{a.name||a.ticker}</h2>
           <span style={{fontFamily:"monospace",fontSize:"0.62rem",fontWeight:600,color:C.gold,letterSpacing:"0.12em",display:"block",marginTop:3}}>{a.ticker} · {a.exchange}</span>
           <span style={{fontFamily:"monospace",fontSize:"0.52rem",color:C.muted}}>{a.sector}</span>
         </div>
-        <div style={{textAlign:"center",padding:"14px 20px",borderRadius:6,background:vc.bg,border:`2px solid ${vc.border}`,minWidth:155}}>
-          <div style={{fontFamily:"Georgia,serif",fontSize:"2rem",fontWeight:900,color:vc.text,lineHeight:1}}>{a.totalScore}<span style={{fontSize:"0.9rem",opacity:0.7}}>/{a.maxScore}</span></div>
-          <span style={{fontFamily:"monospace",fontSize:"0.6rem",fontWeight:700,color:vc.text,display:"block",marginTop:5}}>{VL[a.verdict]?.[lang]}</span>
+        <div style={{display:"flex",flexDirection:"column",gap:8,alignItems:"flex-end"}}>
+          <div style={{textAlign:"center",padding:"14px 20px",borderRadius:6,background:vc.bg,border:`2px solid ${vc.border}`,minWidth:155}}>
+            <div style={{fontFamily:"Georgia,serif",fontSize:"2rem",fontWeight:900,color:vc.text,lineHeight:1}}>{a.totalScore}<span style={{fontSize:"0.9rem",opacity:0.7}}>/{a.maxScore}</span></div>
+            <span style={{fontFamily:"monospace",fontSize:"0.6rem",fontWeight:700,color:vc.text,display:"block",marginTop:5}}>{VL[a.verdict]?.[lang]}</span>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <button onClick={onReanalyze} style={{fontFamily:"monospace",fontSize:"0.52rem",fontWeight:600,padding:"5px 10px",background:"transparent",color:C.navy,border:`1px solid ${C.cream2}`,borderRadius:4,cursor:"pointer"}}>🔄 {t("Re-analizar","Re-analyze")}</button>
+            <button onClick={onExport} style={{fontFamily:"monospace",fontSize:"0.52rem",fontWeight:600,padding:"5px 10px",background:"transparent",color:C.green,border:`1px solid ${C.green}`,borderRadius:4,cursor:"pointer"}}>📥 CSV</button>
+          </div>
         </div>
       </div>
 
+      {/* Score bar */}
       <div style={{...cd,marginBottom:"1.25rem"}}>
         <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
           <span style={{fontFamily:"monospace",fontSize:"0.58rem",fontWeight:600,color:C.navy}}>{t("Score ponderado","Weighted score")}: {a.totalScore} / {a.maxScore}</span>
@@ -233,6 +326,7 @@ function Results({a,lang}){
         </div>
       </div>
 
+      {/* Metrics */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:1,background:C.cream2,borderRadius:6,overflow:"hidden",marginBottom:"1.25rem"}}>
         <MetricCard label={t("Precio","Price")} value={a.price} conf={conf.price} sub={`Cap: ${a.marketCap||"N/A"}`} subConf={conf.marketCap}/>
         <MetricCard label="PER" value={a.metrics?.per} conf={conf.per} sub={`EV/EBITDA: ${a.metrics?.evEbitda||"N/A"}`} subConf={conf.evEbitda}/>
@@ -250,12 +344,13 @@ function Results({a,lang}){
         </div>
       )}
 
+      {/* Layer 2 */}
       <div style={{fontFamily:"monospace",fontSize:"0.52rem",fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:C.navy,marginBottom:"0.75rem"}}>{t("Capa 2 — Psicología","Layer 2 — Psychology")}</div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"0.75rem",marginBottom:"1.25rem"}}>
         {[
-          {label:"CEO",sig:a.layer2?.ceo?.signal,main:a.layer2?.ceo?.name,sub:`${a.layer2?.ceo?.tenure||""} · ${a.layer2?.ceo?.skinInGame||""}`,text:a.layer2?.ceo?.[lang==="es"?"summary_es":"summary_en"]},
-          {label:t("Accionariado","Shareholders"),sig:a.layer2?.shareholders?.signal,main:a.layer2?.shareholders?.topHolder,sub:a.layer2?.shareholders?.type||"",text:a.layer2?.shareholders?.[lang==="es"?"summary_es":"summary_en"]},
-          {label:t("Polémicas","Controversies"),sig:a.layer2?.controversies?.signal,main:`${t("Severidad","Severity")}: ${a.layer2?.controversies?.severity||"N/A"}`,sub:a.layer2?.controversies?.active?"⚠ Activas":"✓ Ninguna",text:a.layer2?.controversies?.[lang==="es"?"summary_es":"summary_en"]},
+          {label:"CEO",sig:a.layer2?.ceo?.signal,main:stripCites(a.layer2?.ceo?.name),sub:`${a.layer2?.ceo?.tenure||""} · ${a.layer2?.ceo?.skinInGame||""}`,text:stripCites(a.layer2?.ceo?.[lang==="es"?"summary_es":"summary_en"])},
+          {label:t("Accionariado","Shareholders"),sig:a.layer2?.shareholders?.signal,main:stripCites(a.layer2?.shareholders?.topHolder),sub:a.layer2?.shareholders?.type||"",text:stripCites(a.layer2?.shareholders?.[lang==="es"?"summary_es":"summary_en"])},
+          {label:t("Polémicas","Controversies"),sig:a.layer2?.controversies?.signal,main:`${t("Severidad","Severity")}: ${a.layer2?.controversies?.severity||"N/A"}`,sub:a.layer2?.controversies?.active?"⚠ Activas":"✓ Ninguna",text:stripCites(a.layer2?.controversies?.[lang==="es"?"summary_es":"summary_en"])},
         ].map((c,i)=>(
           <div key={i} style={cd}>
             <div style={{fontFamily:"monospace",fontSize:"0.5rem",fontWeight:700,textTransform:"uppercase",color:C.muted,marginBottom:"0.5rem"}}>{c.label}</div>
@@ -266,6 +361,7 @@ function Results({a,lang}){
         ))}
       </div>
 
+      {/* 8 Filters */}
       <div style={{fontFamily:"monospace",fontSize:"0.52rem",fontWeight:700,letterSpacing:"0.15em",textTransform:"uppercase",color:C.navy,marginBottom:"0.75rem"}}>{t("Capa 3 — 8 Filtros","Layer 3 — 8 Filters")}</div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:"0.75rem",marginBottom:"1.25rem"}}>
         {["f1","f2","f3","f4","f5","f6","f7","f8"].map(k=>{
@@ -282,26 +378,28 @@ function Results({a,lang}){
                 <Stars n={fd.score||0}/>
                 <span style={{fontFamily:"monospace",fontSize:"0.52rem",color:C.muted,marginLeft:"auto"}}>{fd.pts||0}/{(5*fw(k)).toFixed(1)}pts</span>
               </div>
-              <div style={{fontSize:"0.78rem",color:C.muted,lineHeight:1.6,borderTop:`1px solid ${C.cream2}`,paddingTop:"0.5rem"}}>{fd[lang==="es"?"summary_es":"summary_en"]||""}</div>
+              <div style={{fontSize:"0.78rem",color:C.muted,lineHeight:1.6,borderTop:`1px solid ${C.cream2}`,paddingTop:"0.5rem"}}>{stripCites(fd[lang==="es"?"summary_es":"summary_en"])||""}</div>
               {dq&&<div style={{marginTop:8,fontFamily:"monospace",fontSize:"0.58rem",fontWeight:600,color:C.red,padding:"5px 8px",background:C.redBg,borderRadius:4}}>⛔ {t("DESCARTANTE AUTOMÁTICO","AUTOMATIC DISQUALIFIER")}</div>}
             </div>
           );
         })}
       </div>
 
+      {/* Investment thesis */}
       <div style={{...cd,marginBottom:"1rem"}}>
         <h3 style={{fontFamily:"Georgia,serif",fontSize:"1rem",fontWeight:700,color:C.navy,marginBottom:"0.75rem",paddingBottom:"0.5rem",borderBottom:`1px solid ${C.cream2}`}}>{t("Tesis de inversión","Investment thesis")}</h3>
-        <div style={{fontSize:"0.88rem",lineHeight:1.9,color:C.gray,whiteSpace:"pre-wrap"}}>{a[lang==="es"?"investmentThesis_es":"investmentThesis_en"]||""}</div>
+        <div style={{fontSize:"0.88rem",lineHeight:1.9,color:C.gray,whiteSpace:"pre-wrap"}}>{stripCites(a[lang==="es"?"investmentThesis_es":"investmentThesis_en"])||""}</div>
       </div>
 
       {a.verdict==="GO_COND"&&(a.conditions_es||a.conditions_en)&&(
         <div style={{background:C.yellowBg,border:`1px solid ${C.gold}`,borderRadius:6,padding:"1.25rem",marginBottom:"1rem"}}>
           <h3 style={{fontFamily:"Georgia,serif",fontSize:"1rem",fontWeight:700,color:"#7a5f00",marginBottom:"0.75rem"}}>{t("Condiciones para posición completa","Conditions for full position")}</h3>
-          <div style={{fontSize:"0.88rem",lineHeight:1.9,color:"#7a5f00",whiteSpace:"pre-wrap"}}>{a[lang==="es"?"conditions_es":"conditions_en"]||""}</div>
+          <div style={{fontSize:"0.88rem",lineHeight:1.9,color:"#7a5f00",whiteSpace:"pre-wrap"}}>{stripCites(a[lang==="es"?"conditions_es":"conditions_en"])||""}</div>
         </div>
       )}
+
       <div style={{fontFamily:"monospace",fontSize:"0.52rem",color:C.muted,textAlign:"right",marginTop:"0.5rem"}}>
-        {a.date} · Vendedor de Palas v2.2 · {t(sec.names.es,sec.names.en)} · Finnhub + Claude
+        {a.date} · Vendedor de Palas v2.3 · {t(sec.names.es,sec.names.en)} · Finnhub + Claude
       </div>
     </div>
   );
@@ -340,31 +438,31 @@ export default function App(){
 
   const showToast=msg=>{setToast(msg);setTimeout(()=>setToast(""),3000);};
 
-  const analyze=async()=>{
-    if(!ticker.trim()||loading)return;
-    const tk=ticker.trim().toUpperCase();
-    const sec=CFG.sectors.find(s=>s.key===sectorKey)||CFG.sectors[CFG.sectors.length-1];
+  const analyze=async(reanalyzeItem=null)=>{
+    const tk=(reanalyzeItem?.ticker||ticker).trim().toUpperCase();
+    const exch=reanalyzeItem?.exchange||exchange;
+    const sk=reanalyzeItem?.sectorKey||sectorKey;
+    if(!tk||loading)return;
+    const sec=CFG.sectors.find(s=>s.key===sk)||CFG.sectors[CFG.sectors.length-1];
     setLoading(true);setScreen("loading");setStepIdx(0);setFinnhubStatus(null);
     const steps=STEPS[lang];
     let si=0;
     const timer=setInterval(()=>{si++;if(si<steps.length)setStepIdx(si);else clearInterval(timer);},1000);
     try{
       setStepIdx(0);
-      const fhData=await fetchFinnhub(tk,exchange);
+      const fhData=await fetchFinnhub(tk,exch);
       const hasVerified=Object.keys(fhData.verified).length>0;
       setFinnhubStatus(hasVerified?"ok":"fail");
-      if(hasVerified) showToast(t(`✓ Finnhub: ${Object.keys(fhData.verified).length} métricas verificadas`,`✓ Finnhub: ${Object.keys(fhData.verified).length} verified metrics`));
-      else if(US_EXCHANGES.includes(exchange)) showToast(t("⚠️ Finnhub sin datos","⚠️ Finnhub no data"));
-      else showToast(t("ℹ️ Bolsa no-US — vía web search","ℹ️ Non-US — via web search"));
+      if(hasVerified) showToast(t(`✓ Finnhub: ${Object.keys(fhData.verified).length} métricas`,`✓ Finnhub: ${Object.keys(fhData.verified).length} metrics`));
       setStepIdx(1);
 
-      const res=await fetch("/api/analyze",{
+      const res=await fetch(`${PROXY}/api/analyze`,{
         method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
           model:"claude-sonnet-4-20250514",max_tokens:8000,
           tools:[{type:"web_search_20250305",name:"web_search"}],
           system:buildPrompt(sec,fhData),
-          messages:[{role:"user",content:`Analyze: ${tk} on ${exchange}. Sector: ${sec.names.en}. ${hasVerified?"Finnhub verified data in system prompt — use exact values.":"Search for real data."} Return JSON only.`}]
+          messages:[{role:"user",content:`Analyze: ${tk} on ${exch}. Sector: ${sec.names.en}. ${hasVerified?"Finnhub verified data in system prompt.":"Search for real data."} Return JSON only. No XML tags in text fields.`}]
         })
       });
       clearInterval(timer);setStepIdx(steps.length);
@@ -389,12 +487,18 @@ export default function App(){
 
       a.confidence=a.confidence||{};
       Object.keys(fhData.src).forEach(k=>{a.confidence[k]=fhData.src[k];});
-      a.ticker=tk;a.exchange=exchange;a.sectorKey=sectorKey;
+      a.ticker=tk;a.exchange=exch;a.sectorKey=sk;
       a.sectorConfig={weights:sec.weights,filterNames:sec.filterNames,disqualifier:sec.disqualifier};
       a.fhVerified=fhData.verified;
       a.date=new Date().toLocaleDateString("es-ES",{day:"2-digit",month:"short",year:"numeric"});
 
-      const u=[...portfolio,a];
+      // If reanalyzing, replace old entry; otherwise append
+      let u;
+      if(reanalyzeItem){
+        u=portfolio.map(p=>p.ticker===reanalyzeItem.ticker&&p.date===reanalyzeItem.date?a:p);
+      } else {
+        u=[...portfolio,a];
+      }
       savePf(u);setCurrent(a);setScreen("results");setTicker("");
       showToast(t(`✓ ${tk} analizado`,`✓ ${tk} analyzed`));
     }catch(err){
@@ -419,7 +523,7 @@ export default function App(){
           <div style={{width:30,height:30,background:C.gold,clipPath:"polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>⛏</div>
           <div>
             <span style={{fontFamily:"Georgia,serif",fontSize:"0.95rem",fontWeight:700,color:C.cream}}>Vendedor de Palas</span>
-            <span style={{fontFamily:"monospace",fontSize:"0.48rem",color:C.gold,letterSpacing:"0.15em",display:"block",lineHeight:1}}>INVESTMENT METHOD v2.2 · Finnhub + Claude</span>
+            <span style={{fontFamily:"monospace",fontSize:"0.48rem",color:C.gold,letterSpacing:"0.15em",display:"block",lineHeight:1}}>INVESTMENT METHOD v2.3 · Finnhub + Claude</span>
           </div>
         </div>
         <div style={{display:"flex",gap:4,alignItems:"center"}}>
@@ -448,7 +552,7 @@ export default function App(){
             <div style={{fontFamily:"monospace",fontSize:"0.5rem",color:"rgba(201,168,76,0.6)",marginBottom:8,padding:"5px 8px",background:"rgba(201,168,76,0.05)",borderRadius:4,borderLeft:`2px solid rgba(201,168,76,0.3)`}}>
               {t("Descartante","Disqualifier")}: {(CFG.sectors.find(s=>s.key===sectorKey)||CFG.sectors[0]).disqualifier.toUpperCase()} · Max: {maxScore((CFG.sectors.find(s=>s.key===sectorKey)||CFG.sectors[0]).weights).toFixed(1)}pts
             </div>
-            <button onClick={analyze} disabled={loading}
+            <button onClick={()=>analyze()} disabled={loading}
               style={{fontFamily:"Georgia,serif",fontSize:"0.88rem",fontWeight:700,background:loading?"rgba(201,168,76,0.5)":C.gold,color:C.navy,border:"none",padding:"11px",width:"100%",cursor:loading?"not-allowed":"pointer",borderRadius:4}}>
               {loading?t("⏳ Analizando...","⏳ Analyzing..."):t("⛏ Analizar empresa","⛏ Analyze company")}
             </button>
@@ -462,14 +566,15 @@ export default function App(){
                   const ri2=portfolio.length-1-ri;
                   const isAct=current?.ticker===item.ticker&&current?.date===item.date;
                   const s=CFG.sectors.find(s=>s.key===item.sectorKey)||CFG.sectors[CFG.sectors.length-1];
+                  const days=analysisAge(item.date);
                   return(
                     <div key={ri2} onClick={()=>{setCurrent(item);setScreen("results");}}
-                      style={{background:isAct?"rgba(201,168,76,0.14)":"rgba(255,255,255,0.04)",border:`1px solid ${isAct?C.gold:"rgba(201,168,76,0.2)"}`,borderRadius:4,padding:"8px 10px",cursor:"pointer",display:"flex",alignItems:"center",gap:7}}>
+                      style={{background:isAct?"rgba(201,168,76,0.14)":"rgba(255,255,255,0.04)",border:`1px solid ${isAct?C.gold:days>30?"rgba(201,168,76,0.5)":"rgba(201,168,76,0.2)"}`,borderRadius:4,padding:"8px 10px",cursor:"pointer",display:"flex",alignItems:"center",gap:7}}>
                       <span style={{fontSize:"0.85rem"}}>{s?.icon||"🌐"}</span>
                       <div style={{fontFamily:"monospace",fontSize:"0.72rem",fontWeight:700,color:C.gold,minWidth:46}}>{item.ticker}</div>
                       <div style={{flex:1,overflow:"hidden"}}>
                         <div style={{fontSize:"0.68rem",color:C.cream,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{item.name||item.ticker}</div>
-                        <div style={{fontFamily:"monospace",fontSize:"0.44rem",color:C.muted}}>{item.exchange} · {item.date}</div>
+                        <div style={{fontFamily:"monospace",fontSize:"0.44rem",color:days>30?"#e08030":C.muted}}>{item.exchange} · {item.date}{days>30?` · ⚠️${days}d`:""}</div>
                       </div>
                       <Bdg v={item.verdict}/>
                       <button onClick={e=>{e.stopPropagation();removeItem(ri2);}} style={{background:"none",border:"none",color:"rgba(255,255,255,0.2)",cursor:"pointer",fontSize:"0.85rem",padding:"0 2px"}}>×</button>
@@ -490,7 +595,7 @@ export default function App(){
                 {t("Datos financieros reales vía Finnhub + análisis GO/NO GO con Claude.","Real financial data via Finnhub + GO/NO GO analysis with Claude.")}
               </p>
               <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
-                {[t("✓ Precio en tiempo real","✓ Real-time price"),t("✓ Métricas verificadas","✓ Verified metrics"),t("✓ 8 filtros ponderados","✓ 8 weighted filters"),t("✓ Tesis de inversión","✓ Investment thesis")].map((f,i)=>(
+                {[t("✓ Precio en tiempo real","✓ Real-time price"),t("✓ Métricas verificadas","✓ Verified metrics"),t("✓ Sanity checks automáticos","✓ Auto sanity checks"),t("✓ Export CSV","✓ CSV Export"),t("✓ Re-análisis con 1 click","✓ 1-click re-analyze")].map((f,i)=>(
                   <span key={i} style={{fontFamily:"monospace",fontSize:"0.52rem",color:C.verifiedText,background:C.verifiedBg,border:"1px solid rgba(26,107,60,0.2)",borderRadius:10,padding:"4px 10px"}}>{f}</span>
                 ))}
               </div>
@@ -501,8 +606,7 @@ export default function App(){
               <div style={{width:48,height:48,border:`3px solid rgba(201,168,76,0.2)`,borderTopColor:C.gold,borderRadius:"50%",animation:"spin 1s linear infinite"}}/>
               <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
               <div style={{textAlign:"center"}}>
-                <div style={{fontFamily:"Georgia,serif",fontSize:"1.2rem",fontWeight:700,color:C.navy,marginBottom:4}}>{t(`Analizando ${ticker.toUpperCase()}...`,`Analyzing ${ticker.toUpperCase()}...`)}</div>
-                <div style={{fontFamily:"monospace",fontSize:"0.6rem",color:C.muted}}>{exchange} · {lang==="es"?(CFG.sectors.find(s=>s.key===sectorKey)||CFG.sectors[0]).names.es:(CFG.sectors.find(s=>s.key===sectorKey)||CFG.sectors[0]).names.en}</div>
+                <div style={{fontFamily:"Georgia,serif",fontSize:"1.2rem",fontWeight:700,color:C.navy,marginBottom:4}}>{t(`Analizando...`,`Analyzing...`)}</div>
                 {finnhubStatus==="ok"&&<div style={{fontFamily:"monospace",fontSize:"0.55rem",color:C.verifiedText,marginTop:6,background:C.verifiedBg,padding:"3px 10px",borderRadius:10,display:"inline-block"}}>✓ Finnhub data loaded</div>}
                 {finnhubStatus==="fail"&&<div style={{fontFamily:"monospace",fontSize:"0.55rem",color:"#7a5f00",marginTop:6,background:C.yellowBg,padding:"3px 10px",borderRadius:10,display:"inline-block"}}>⚠ Sin datos Finnhub — usando web search</div>}
               </div>
@@ -524,7 +628,14 @@ export default function App(){
               </div>
             </div>
           )}
-          {screen==="results"&&current&&<Results a={current} lang={lang}/>}
+          {screen==="results"&&current&&(
+            <Results
+              a={current}
+              lang={lang}
+              onReanalyze={()=>analyze(current)}
+              onExport={()=>exportCSV(current,lang)}
+            />
+          )}
         </main>
       </div>
     </div>
